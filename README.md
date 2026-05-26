@@ -65,7 +65,27 @@ liger_kernel==0.5.3
 math-verify==0.5.2
 ```
 
-安装项目：
+本仓库提供了从本地训练环境导出的 `requirements.txt`。推荐新环境按下面顺序安装：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
+
+如果你使用 conda：
+
+```bash
+conda create -n g2rpoa python=3.10 -y
+conda activate g2rpoa
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
+
+如果只想安装项目本身：
 
 ```bash
 pip install -e .
@@ -81,6 +101,18 @@ pip install 'swanlab[dashboard]'
 注意：原始 `setup.py` 中 TRL 依赖仍然是注释状态，因为该项目依赖特定 TRL 版本。训练前需要自行安装与当前代码兼容的 TRL。
 
 另外，部分环境下 `transformers==4.49.0` 不能识别 Qwen3 的 `model_type=qwen3`。如果加载 Qwen3 时出现 `ValueError: model type 'qwen3' not recognised`，需要升级 Transformers 到支持 Qwen3 的版本。
+
+`requirements.txt` 中包含 `flash-attn==2.7.4.post1`。这个包对 CUDA、PyTorch、Python 版本和 ABI 很敏感。如果直接 `pip install -r requirements.txt` 编译失败，可以先删除或注释这一行，再安装与你机器匹配的 wheel。例如本地实验使用的是匹配 `torch 2.5 / cu12 / cp310 / cxx11abiFALSE` 的 wheel。
+
+本地实验实际使用的关键版本为：
+
+```text
+torch==2.5.1+cu124
+transformers==4.51.3
+trl @ git+https://github.com/huggingface/trl.git@69ad852e5654a77f1695eb4c608906fe0c7e8624
+vllm==0.7.2
+flash-attn==2.7.4.post1
+```
 
 ## 数据准备
 
