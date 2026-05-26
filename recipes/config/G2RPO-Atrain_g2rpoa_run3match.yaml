@@ -1,0 +1,72 @@
+# G2RPO-A run that mirrors the run3 GRPO baseline (archives/run3_fmt10).
+# Differences vs G2RPO-Atrain.yaml: reward_weights=[1.0, 1.0] (run3 fix),
+# Qwen3-1.7B local path, push_to_hub=false. Differences vs the GRPO run:
+# num_generations=6 and per_device_train_batch_size=6, plus the G2RPO-A
+# trainer flags from G2RPO-Atrain_g2rpoa.yaml.
+
+# Model arguments
+model_name_or_path: /share/models/Qwen3/Qwen3-1.7B
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Data training arguments
+dataset_name: Blancy/verifiable-coding-problems-CoT
+system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
+
+# GRPO trainer config (run3-matching)
+bf16: true
+use_vllm: true
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.5
+do_eval: false
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+hub_model_id: Qwen3-1.7B-G2RPO-A-Code
+hub_strategy: every_save
+learning_rate: 1.0e-05
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+max_prompt_length: 512
+# G2RPO-A trainer subtracts guidance length from this, so it must be an int.
+# 4096 = vllm_max_model_len(4608) - max_prompt_length(512), matches run3's
+# effective budget (run3 used None which let vLLM use the remaining context).
+max_completion_length: 4096
+vllm_max_model_len: 4608
+max_steps: -1
+num_generations: 6
+num_train_epochs: 5
+output_dir: data/g2rpoa_run3match
+overwrite_output_dir: false
+per_device_eval_batch_size: 6
+per_device_train_batch_size: 6
+push_to_hub: false
+swanlab_project: "open-r1-swanlab"
+report_to: []
+reward_funcs:
+- code
+- format
+reward_weights:
+- 1.0
+- 1.0
+save_strategy: "epoch"
+save_total_limit: 1
+seed: 42
+temperature: 0.7
+warmup_ratio: 0.05
+
+# G2RPO-A trainer config
+use_g2rpoa: true
+guided_ratio: 1.0
+guidance_length_init: 384
+max_guidance_length: 768
+guidance_history_t: 2
+guidance_wrap_think: true

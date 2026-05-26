@@ -50,6 +50,41 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
+    use_g2rpoa: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the local G2RPO-A trainer instead of TRL's vanilla GRPOTrainer."},
+    )
+    guided_ratio: float = field(
+        default=1.0,
+        metadata={"help": "Fraction of generations per prompt that receive a gold reasoning prefix."},
+    )
+    guidance_length_init: int = field(
+        default=3072,
+        metadata={"help": "Initial number of gold reasoning tokens prepended to guided rollouts."},
+    )
+    max_guidance_length: int = field(
+        default=3072,
+        metadata={"help": "Upper bound for the adaptive guidance length."},
+    )
+    guidance_history_t: int = field(
+        default=2,
+        metadata={"help": "Reward-history window T used by the adaptive guidance-length update."},
+    )
+    guidance_wrap_think: bool = field(
+        default=True,
+        metadata={"help": "Whether to wrap the guided reasoning prefix with an opening <think> tag."},
+    )
+    use_curriculum: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, replace TRL's RepeatRandomSampler with a deterministic sequential "
+                "sampler so the training data preserves the on-disk order. Required to "
+                "actually realize the easy->hard curriculum from arXiv:2508.13023 §4.3; "
+                "without it TRL reshuffles every epoch and CL ordering is lost."
+            )
+        },
+    )
 
 
 @dataclass

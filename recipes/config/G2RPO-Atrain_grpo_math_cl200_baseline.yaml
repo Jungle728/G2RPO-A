@@ -1,0 +1,93 @@
+# Vanilla GRPO baseline for the CL200 math experiment.
+#
+# This config matches `G2RPO-Atrain_g2rpoa_math_cl200.yaml` in every dimension
+# *except* the G2RPO-A guidance machinery, so the two runs differ only in
+# whether ground-truth reasoning prefixes are injected.
+#
+# Differences vs the G2RPO-A run:
+#   - `use_g2rpoa: false`       -> trainer is TRL's stock `GRPOTrainer`
+#                                  instead of `G2RPOATrainer`. No prefix
+#                                  injection at rollout time.
+#   - `guided_ratio: 0.0`       -> double safety; vanilla trainer ignores it.
+#   - `guidance_*` knobs        -> kept but unused, so the diff to the
+#                                  G2RPO-A yaml is minimal/auditable.
+#   - `use_curriculum: false`   -> the sequential sampler lives only inside
+#                                  G2RPOATrainer (`g2rpoa_trainer.py:600`),
+#                                  vanilla GRPOTrainer always uses TRL's
+#                                  `RepeatRandomSampler`. We surface this
+#                                  intentionally; documented below.
+#
+# Caveat: with `use_g2rpoa: false` the on-disk easy->hard order in
+# `data/openr1_math_cl200` does NOT translate into curriculum training. TRL's
+# `RepeatRandomSampler` reshuffles every epoch with `seed=training_args.seed`.
+# So this run is "GRPO + random ordering" (paper Table 6 "Random" column),
+# not "GRPO + CL". If you want a "GRPO + CL" baseline, that's a separate yaml
+# that needs trainer-side changes (sequential sampler in TRL GRPOTrainer too).
+
+# Model arguments
+model_name_or_path: /share/models/Qwen3/Qwen3-1.7B
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Data: same 200-row CL subset (order on disk is easy->hard, but TRL will shuffle).
+dataset_name: data/openr1_math_cl200
+system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>. Put your final mathematical answer inside \\boxed{...} within the <answer> block."
+
+# GRPO trainer config (identical to the G2RPO-A run)
+bf16: true
+use_vllm: true
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.85
+do_eval: false
+gradient_accumulation_steps: 5
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+hub_model_id: Qwen3-1.7B-GRPO-Math-CL200-Baseline
+hub_strategy: every_save
+learning_rate: 1.0e-05
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+max_prompt_length: 512
+max_completion_length: 3328
+vllm_max_model_len: 3840
+max_steps: -1
+num_generations: 4
+num_train_epochs: 5
+output_dir: data/grpo_math_cl200_baseline_run
+overwrite_output_dir: false
+per_device_eval_batch_size: 8
+per_device_train_batch_size: 8
+push_to_hub: false
+swanlab_project: "open-r1-swanlab"
+report_to: []
+reward_funcs:
+- accuracy
+- format
+reward_weights:
+- 1.0
+- 0.1
+save_strategy: "epoch"
+save_total_limit: 5
+seed: 42
+temperature: 0.7
+warmup_ratio: 0.05
+
+# G2RPO-A trainer config: disabled. Vanilla TRL GRPOTrainer ignores all of these.
+use_g2rpoa: false
+guided_ratio: 0.0
+guidance_length_init: 384
+max_guidance_length: 768
+guidance_history_t: 2
+guidance_wrap_think: false
+
+# Curriculum sampler is a G2RPOATrainer-only feature. With `use_g2rpoa: false`
+# this flag is read but never consulted; left for documentation.
+use_curriculum: false

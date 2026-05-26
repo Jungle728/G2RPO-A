@@ -66,7 +66,9 @@ def accuracy_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
+    # Loosened to accept any whitespace (including a single space) between tags,
+    # because Qwen3 chat-template completions often use spaces instead of `\n`.
+    pattern = r"^\s*<think>\s*.*?\s*</think>\s*<answer>\s*.*?\s*</answer>\s*$"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
@@ -373,8 +375,8 @@ def code_reward(completions, **kwargs) -> list[float]:
             for code, info in zip(code_snippets, verification_info)
         ]
         with Sandbox(timeout=30, request_timeout=3) as sbx:
-            for script in scripts:
-                execution = sbx.run_code(script, language=verification_info["language"])
+            for script, info in zip(scripts, verification_info):
+                execution = sbx.run_code(script, language=info["language"])
                 try:
                     output = float(execution.text)
                 except (TypeError, ValueError):

@@ -1,0 +1,85 @@
+# G2RPO-A math RL config for Qwen3-0.6B (post-trained), matches paper §5.1 setup.
+# Variant of G2RPO-Atrain_g2rpoa_math_cl200.yaml. Only deltas:
+#   - model_name_or_path        -> Qwen3-0.6B
+#   - guided_ratio              -> 0.75 (paper Table 9 best for Qwen3-0.6B math).
+#                                  Smaller models need stronger guidance.
+#   - hub_model_id / output_dir -> renamed for the 0.6B run.
+# Everything else (data, batch, lr, max_completion_length, rewards, CL flag,
+# guidance_length_init/max, guidance_history_t, guidance_wrap_think) is identical
+# to the 1.7B run so the comparison is clean.
+
+# Model arguments
+model_name_or_path: /share/models/Qwen3/Qwen3-0.6B
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Data: local arrow dir written by scripts/build_math_cl_subset.py.
+# `make_conversation` in grpo.py picks `problem` for the user turn and copies
+# `answer` -> `solution` (already wrapped in $...$ by the build script).
+dataset_name: data/openr1_math_cl200
+system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>. Put your final mathematical answer inside \\boxed{...} within the <answer> block."
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.85
+do_eval: false
+gradient_accumulation_steps: 5
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+hub_model_id: Qwen3-0.6B-G2RPO-A-Math-CL200
+hub_strategy: every_save
+learning_rate: 1.0e-05
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+max_prompt_length: 512
+# Smaller model frees ~17 GB vs 1.7B (params + optimizer states), spent on
+# longer rollouts. 4608 is the engineering ceiling on a single 80GB H100 with
+# Zero-2 + per_device_train_batch=8 * num_generations=4 = 32 concurrent
+# sequences; the paper's 8192 assumes 8x A100 + Zero-3 sharding which we don't
+# have here. See chat history 2026-05-26 for the per-component memory breakdown.
+max_completion_length: 4608
+vllm_max_model_len: 5120
+max_steps: -1
+num_generations: 4
+num_train_epochs: 5
+output_dir: data/g2rpoa_math_cl200_qwen3_0.6b_run
+overwrite_output_dir: false
+per_device_eval_batch_size: 8
+per_device_train_batch_size: 8
+push_to_hub: false
+swanlab_project: "open-r1-swanlab"
+report_to: []
+reward_funcs:
+- accuracy
+- format
+reward_weights:
+- 1.0
+- 0.1
+save_strategy: "epoch"
+save_total_limit: 5
+seed: 42
+temperature: 0.7
+warmup_ratio: 0.05
+
+# G2RPO-A trainer config
+use_g2rpoa: true
+guided_ratio: 0.75            # Paper Table 9 best for Qwen3-0.6B math (alpha = 3/4).
+guidance_length_init: 384
+max_guidance_length: 768
+guidance_history_t: 2
+# OpenR1-Math `generations` already starts with `<think>\n...`, so don't wrap
+# again -- doing so produces "<think>\n<think>\n..." in the rollout prompt.
+guidance_wrap_think: false
+
+# Curriculum learning: preserve on-disk easy->hard order each epoch.
+use_curriculum: true

@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import math
 import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union, Iterator
+from pathlib import Path
+from typing import Any, Callable, Iterator, Optional, Sized, Union
 from unittest.mock import patch
 
 import torch
@@ -42,12 +45,12 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
-from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from ..import_utils import is_vllm_available
-from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from .callbacks import SyncRefModelCallback
-from .grpo_config import GRPOConfig
-from .utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+from open_r1.configs import GRPOConfig
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from trl.import_utils import is_vllm_available
+from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from trl.trainer.callbacks import SyncRefModelCallback
+from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -58,12 +61,29 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
-import math
-from transformers import TrainerCallback
-
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+def _per_step_completion_writer(prompts, completions, rewards, step):
+    out_dir = Path(os.environ.get("STEP_LOG_DIR", "logs/steps"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"step_{int(step):05d}.jsonl"
+    with path.open("a") as f:
+        for prompt, completion, reward in zip(prompts, completions, rewards):
+            f.write(
+                json.dumps(
+                    {
+                        "step": int(step),
+                        "prompt": prompt,
+                        "completion": completion,
+                        "reward": float(reward),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 class RepeatRandomSampler(Sampler):
@@ -181,7 +201,7 @@ class RepeatSequentialSampler(Sampler[int]):
 
 ############################################################################################################################################################
 
-class GRPOTrainer(Trainer):
+class G2RPOATrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
@@ -284,9 +304,6 @@ class GRPOTrainer(Trainer):
             optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (
                     None, None),
             peft_config: Optional["PeftConfig"] = None,
-            _prev_accuracy_rewards=None,  # type: Optional[torch.Tensor]
-            guidance_length=None,  # type: Optional[torch.Tensor]
-            max_guidance_length=3072,
     ):
         # Args
         if args is None:
@@ -400,6 +417,7 @@ class GRPOTrainer(Trainer):
         self.use_vllm = args.use_vllm
 
         self.beta = args.beta
+        self.epsilon = args.epsilon
         # self.beta = 0
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -415,9 +433,21 @@ class GRPOTrainer(Trainer):
         self.log_completions = args.log_completions
 
         ######################################################把新增变量扩展到全局########################################################
+        if not 0.0 <= args.guided_ratio <= 1.0:
+            raise ValueError(f"guided_ratio must be in [0, 1], got {args.guided_ratio}.")
+        if args.guidance_length_init < 1:
+            raise ValueError(f"guidance_length_init must be >= 1, got {args.guidance_length_init}.")
+        if args.max_guidance_length < 1:
+            raise ValueError(f"max_guidance_length must be >= 1, got {args.max_guidance_length}.")
+        if args.guidance_history_t < 1:
+            raise ValueError(f"guidance_history_t must be >= 1, got {args.guidance_history_t}.")
+
         self._prev_accuracy_rewards = []
-        self.guidance_length = guidance_length
-        self.max_guidance_length = max_guidance_length
+        self.guidance_length = min(args.guidance_length_init, args.max_guidance_length)
+        self.max_guidance_length = args.max_guidance_length
+        self.guided_ratio = args.guided_ratio
+        self.guidance_history_t = args.guidance_history_t
+        self.guidance_wrap_think = args.guidance_wrap_think
 
         # 添加新的变量用于步骤管理
         self._step_accuracies = []         # 存储当前 global_step 的所有 micro-batch 准确率
@@ -464,6 +494,9 @@ class GRPOTrainer(Trainer):
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
+
+        if not self.use_vllm:
+            raise NotImplementedError("G2RPO-A prefix guidance currently requires use_vllm=True.")
 
         if self.use_vllm:
             if not is_vllm_available():
@@ -568,6 +601,11 @@ class GRPOTrainer(Trainer):
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
+        if getattr(self.args, "use_curriculum", False):
+            # Curriculum learning (arXiv:2508.13023 §4.3): preserve on-disk
+            # easy->hard order across epochs. TRL's RepeatRandomSampler reshuffles
+            # every iteration which destroys the curriculum.
+            return RepeatSequentialSampler(self.train_dataset, self.num_generations)
         return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
@@ -575,6 +613,8 @@ class GRPOTrainer(Trainer):
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
+        if getattr(self.args, "use_curriculum", False):
+            return RepeatSequentialSampler(eval_dataset, self.num_generations)
         return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
@@ -619,95 +659,60 @@ class GRPOTrainer(Trainer):
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
-    ################################################################################################################################################################
-    def _compute_new_guidance_length(self, current_step_accuracy, global_step): # 这个函数也是只在一个global step内被调用一次，而不是micro step
-        """
-        以 3 步为一个周期：
-          - 第 0 步 (mod 3 == 0)：收集 prev[0]，不更新
-          - 第 1 步 (mod 3 == 1)：收集 prev[1]，不更新
-          - 第 2 步 (mod 3 == 2)：用 (prev[0]+prev[1])/2 与当前步比较，
-                                   得到新的 guidance_length，
-                                   更新后立即把缓存重置，只留下本步 accuracy
-                                   供下一循环使用
-        更新完的 guidance_length 会在 *下一* 个 global_step
-        进入 `_prepare_inputs` 时被锁定使用。
-        """
 
-        # 保证缓存是列表
+    def _get_guidance_lengths(self, total_generations: int, guidance_length: int) -> list[int]:
+        """Return per-rollout guidance lengths, grouped by `num_generations`."""
+        guided_count = math.ceil(self.guided_ratio * self.num_generations)
+        guided_count = max(0, min(guided_count, self.num_generations))
+        return [guidance_length if (idx % self.num_generations) < guided_count else 0 for idx in range(total_generations)]
+
+    def _build_guidance_prefix_ids(self, text: str, max_tokens: int) -> list[int]:
+        if max_tokens <= 0:
+            return []
+
+        if self.guidance_wrap_think:
+            text = "<think>\n" + text.lstrip()
+
+        tokens = self.processing_class.encode(text, add_special_tokens=False)
+        return tokens[:max_tokens]
+
+    ################################################################################################################################################################
+    def _compute_new_guidance_length(self, current_step_accuracy, global_step):
+        """Apply the G2RPO-A adaptive guidance update once per global step."""
         if not isinstance(self._prev_accuracy_rewards, list):
             self._prev_accuracy_rewards = []
 
-        cycle_pos = (global_step - 1) % 3 # 这里之所以要减一是因为实践中发现会有一个初始值0，不减的话第一步的值会直接除以2作为两步的平均值
-
-        # --- 前两步：只收集 ---
-        if cycle_pos in (0, 1):
-            if cycle_pos == 0:
-                # 周期首步，清空缓存
-                self._prev_accuracy_rewards = [current_step_accuracy]
-            else:
-                # 周期第二步，追加
-                self._prev_accuracy_rewards.append(current_step_accuracy)
-
+        history = self._prev_accuracy_rewards[-self.guidance_history_t :]
+        if not history:
+            self._prev_accuracy_rewards.append(current_step_accuracy)
             if self.accelerator.is_main_process:
                 print(
-                    f"Step {global_step}: collected accuracy "
-                    f"(cycle_pos={cycle_pos}) -> buffer={self._prev_accuracy_rewards}"
+                    f"Step {global_step}: collected initial accuracy "
+                    f"{current_step_accuracy:.4f}; guidance_length stays {self.guidance_length}"
                 )
-            return self.guidance_length  # 不更新
-
-        # --- 第三步：开始比较并决定 ---
-        # 正常情况下这里一定已经有两条历史值
-        if len(self._prev_accuracy_rewards) < 2:
-            # 意外情况兜底，因为一般来说，前面流程走完之后_prev_accuracy_rewards里面已经有两个值了
-            if self.accelerator.is_main_process:
-                print(f"Step {global_step}: buffer size < 2, skip update")
-            self._prev_accuracy_rewards = [current_step_accuracy]
             return self.guidance_length
 
-        avg_prev_two = sum(self._prev_accuracy_rewards) / 2.0
+        avg_prev = sum(history) / len(history)
+        eps = 1e-8
+        ratio = (avg_prev + eps) / (current_step_accuracy + eps)
+        new_guidance_length = int(round(self.guidance_length * ratio))
+        new_guidance_length = max(1, min(new_guidance_length, self.max_guidance_length))
+
+        self._prev_accuracy_rewards.append(current_step_accuracy)
+        self._prev_accuracy_rewards = self._prev_accuracy_rewards[-self.guidance_history_t :]
+
         if self.accelerator.is_main_process:
             print(
-                f"Step {global_step}: Comparison - "
-                f"avg_prev_two_steps={avg_prev_two:.4f} vs current={current_step_accuracy:.4f}"
+                f"Step {global_step}: guidance update history_avg={avg_prev:.4f}, "
+                f"current={current_step_accuracy:.4f}, "
+                f"ratio={ratio:.4f}, "
+                f"guidance_length={self.guidance_length}->{new_guidance_length}"
             )
-
-        new_guidance_length = self.guidance_length  # 默认保持不变，好像有没有这句话都不影响
-        if current_step_accuracy > 0 and avg_prev_two > 0:
-            if current_step_accuracy < avg_prev_two:
-                ratio = avg_prev_two / current_step_accuracy
-                new_guidance_length = int(
-                    min(self.guidance_length * ratio, self.max_guidance_length)
-                )
-                if self.accelerator.is_main_process:
-                    print(
-                        f"Step {global_step}: ↓performance, ↑guidance "
-                        f"(ratio={ratio:.2f})"
-                    )
-            elif current_step_accuracy > avg_prev_two:
-                ratio = avg_prev_two / current_step_accuracy
-                new_guidance_length = int(
-                    max(int(self.guidance_length * ratio), 1)
-                )
-                if self.accelerator.is_main_process:
-                    print(
-                        f"Step {global_step}: ↑performance, ↓guidance "
-                        f"(ratio={ratio:.2f})"
-                    )
-
-        # 为下一周期准备，只留下当前步
-        self._prev_accuracy_rewards = [current_step_accuracy] # 只保留当前步的准确率，如果下一步是3步周期中的第一步，会执行和这一句话一样的操作，等于多赋值了一次，不过不影响结果；
-                                                              # 如果为3步周期中的第二步，那么下一步会将其步得到的accuracy_reward添加到列表尾部，这样一来就等于累积了3步周期中的第一步和第二步的accuracy_reward
-        if self.accelerator.is_main_process and new_guidance_length == self.guidance_length:
-            print(f"Step {global_step}: Performance stable, guidance unchanged")
 
         return new_guidance_length
     ###############################################################################################################################################################
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
-        # 如果 guidance_length 是 None，则进行初始化，以防止 TypeError
-        if self.guidance_length is None:
-            self.guidance_length = 3072
-        
         # 在步骤开始时锁定 guidance_length
         if self._step_guidance_length is None or self.state.global_step != getattr(self, '_last_step', -1):
             self._step_guidance_length = self.guidance_length
@@ -738,16 +743,6 @@ class GRPOTrainer(Trainer):
         # geminis = [x["gemini_attempt"] for x in inputs]
         # solution = [x["solution"] for x in inputs]
         generations = [x["generations"] for x in inputs]
-
-        # 截取前面的tokens，因为tokens不像characters，所以需要转化一下再截取
-        # 修改 truncate_text 函数，使其自动处理 token 长度判断
-        def truncate_text(text, max_tokens=50):
-            tokens = self.processing_class.encode(text, add_special_tokens=False)  # 先获取完整 token 列表
-            if len(tokens) > max_tokens:  # 只有当 token 数超过 50 时才截取
-                tokens = tokens[:max_tokens]
-            elif len(tokens) < max_tokens:
-                tokens += [self.processing_class.pad_token_id] * (max_tokens - len(tokens))  # 不足 50 的补 pad_token_id
-            return tokens
 
         # If you still recall, "processing_class" will be assigned with a tokenizer if its value is "None" (See the 266^th line)
         # Generally, it will be pointed as a tokenizer when calling the GRPOTrainer class. See the file "grpo.py".
@@ -785,23 +780,23 @@ class GRPOTrainer(Trainer):
                 # 用一个列表存储x的不同值
                 completion_ids = []
 
-                x_list = [current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          current_guidance_length, current_guidance_length, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                x_list = self._get_guidance_lengths(len(all_prompts_text), current_guidance_length)
                 global_step = self.state.global_step
 
-                print(f"Debug: [Step {global_step}] x_list = {x_list}")
+                guided_rollouts = sum(1 for length in x_list if length > 0)
+                print(
+                    f"Debug: [Step {global_step}] guided_rollouts={guided_rollouts}/{len(x_list)}, "
+                    f"guidance_length={current_guidance_length}, "
+                    f"guided_ratio={self.guided_ratio}, num_generations={self.num_generations}"
+                )
 
                 appended_ids_list = []
                 appended_tokens_list = []
+                appended_lengths = []
                 prompt1_list = []
 
                 for x1, prompt1, ds in zip(x_list, all_prompts_text, generations):
-                    appended_ids = truncate_text(ds, max_tokens=x1)
+                    appended_ids = self._build_guidance_prefix_ids(ds, max_tokens=x1)
                     appended_ids = torch.tensor(appended_ids, dtype=torch.long, device=device)
                     appended_tokens = self.processing_class.decode(appended_ids, skip_special_tokens=True)
 
@@ -813,14 +808,62 @@ class GRPOTrainer(Trainer):
                     # 保存结果到列表中
                     appended_ids_list.append(appended_ids)
                     appended_tokens_list.append(appended_tokens)
+                    appended_lengths.append(len(appended_ids))
                     prompt1_list.append(prompt1)
 
-                    # 由于我们单个单个处理，completion_ids只有一个维度，因此其长度就是token的数量
-                    print(f"Debug: The length of appended_ids: {len(appended_ids)}")
+                if len(prompt1_list) != len(all_prompts_text):
+                    raise RuntimeError(
+                        "Guidance construction produced a different number of prompts "
+                        f"({len(prompt1_list)}) than input prompts ({len(all_prompts_text)})."
+                    )
 
-                # 这里得到了整个的appended_ids_list和appended_tokens_list列表
-                outputs = self.llm.generate(prompt1_list, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                # Keep the total completion budget identical to unguided GRPO:
+                # guidance tokens count as part of the completion, so vLLM only
+                # generates the remaining budget after the prefix.
+                #
+                # Performance: vLLM's continuous batching can serve hundreds of
+                # sequences in parallel, but only when fed in a single
+                # `llm.generate(list_of_prompts, sampling_params)` call. The
+                # original implementation looped one prompt at a time, which
+                # forced vLLM to run a single sequence per call and made the
+                # generation step scale linearly with batch size (~50x slower
+                # than necessary on a 1.7B model + H100).
+                #
+                # We group prompts by their per-row `max_tokens` (= total
+                # completion budget minus that row's guidance length). Within
+                # a step the guidance length is locked, so there are at most
+                # two distinct values: one for guided rollouts and
+                # `max_completion_length` for unguided ones. Each group is
+                # served in a single batched call, then results are stitched
+                # back to the original order.
+                completion_ids = [None] * len(prompt1_list)
+                groups: dict[int, list[int]] = {}
+                for idx, appended_ids in enumerate(appended_ids_list):
+                    remaining = max(self.max_completion_length - len(appended_ids), 1)
+                    groups.setdefault(remaining, []).append(idx)
+
+                for remaining_tokens, idxs in groups.items():
+                    sampling_params = SamplingParams(
+                        temperature=self.args.temperature,
+                        max_tokens=remaining_tokens,
+                        stop=["</answer>", "<|endoftext|>", "</ answer>"],
+                    )
+                    batch_prompts = [prompt1_list[i] for i in idxs]
+                    outputs = self.llm.generate(
+                        batch_prompts, sampling_params=sampling_params, use_tqdm=False
+                    )
+                    if len(outputs) != len(idxs):
+                        raise RuntimeError(
+                            f"vLLM returned {len(outputs)} outputs for {len(idxs)} prompts in group max_tokens={remaining_tokens}"
+                        )
+                    for orig_idx, out in zip(idxs, outputs):
+                        completion_ids[orig_idx] = out.outputs[0].token_ids
+
+                if any(c is None for c in completion_ids):
+                    missing = [i for i, c in enumerate(completion_ids) if c is None]
+                    raise RuntimeError(
+                        f"Batched vLLM generation missed indices: {missing[:10]} (total {len(missing)})"
+                    )
 
                 for i in range(len(completion_ids)):
                     # 把 completion_ids[i] 变成 tensor
@@ -840,11 +883,16 @@ class GRPOTrainer(Trainer):
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            guidance_lengths = broadcast_object_list(
+                appended_lengths if self.accelerator.is_main_process else [None] * len(all_prompts_text),
+                from_process=0,
+            )
             process_slice = slice(
                 self.accelerator.process_index * len(prompts),
                 (self.accelerator.process_index + 1) * len(prompts),
             )
             completion_ids = completion_ids[process_slice]
+            guidance_lengths = guidance_lengths[process_slice]
 
             # 发生更改，将prompt用于生成之后再转化为只有问题的prompt
             prompts_text = original_prompts_text
@@ -883,18 +931,29 @@ class GRPOTrainer(Trainer):
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        completion_attention_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
         # 在这里新增一行，专门屏蔽 pad_token 的位置
         pad_positions = completion_ids.eq(self.processing_class.pad_token_id)  # 这里会专门找到padding token的位置
-        completion_mask[pad_positions] = 0  # 创建一个mask矩阵，在padding token的位置上设置为0
+        completion_attention_mask[pad_positions] = 0  # 创建一个mask矩阵，在padding token的位置上设置为0
+
+        # Guidance tokens are injected into the rollout context, not sampled actions.
+        # Keep them visible in attention, but exclude them from GRPO loss/KL/clip statistics.
+        completion_mask = completion_attention_mask.clone()
+        if self.args.use_vllm:
+            for row_idx, guidance_len in enumerate(guidance_lengths):
+                if guidance_len:
+                    completion_mask[row_idx, : min(int(guidance_len), completion_mask.size(1))] = 0
 
         # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_attention_mask], dim=1)  # (B*G, P+C)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         with torch.inference_mode():
+            old_per_token_logps = self._get_per_token_logps(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep
+            )
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
@@ -923,7 +982,7 @@ class GRPOTrainer(Trainer):
         # 生成了5个completions，那么这个张量就是[5, 3]的形状，5是生成的completions的数量，3是reward函数的数量。
         # len(prompts)实际上是per_device_train_batch_size
 
-        accuracy_reward_func = torch.zeros(len(prompts), device=device)  # 这个是用来存储accuracy的reward的
+        guidance_reward_func = None  # 用 accuracy/code reward 驱动自适应 guidance_length；否则回退到加权总 reward。
 
         for i, (reward_func, reward_processing_class) in enumerate(
                 zip(self.reward_funcs, self.reward_processing_classes)  # reward_funcs是一个list，里面存放的是不同的reward函数
@@ -951,37 +1010,40 @@ class GRPOTrainer(Trainer):
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32,
                                                       device=device)  # 这里对各个completion是批量处理的，反而是对于每种reward是循环单独处理的
                 ####################################################################################我自己添加的用来求accuracy reward的片段#################################################################################
-                if reward_func.__name__ == "accuracy_reward":
-                    print(f"Step {self.state.global_step}: Raw accuracy_reward output = {output_reward_func}")
-                    print(f"Step {self.state.global_step}: accuracy_reward tensor = {rewards_per_func[:, i]}")
-                    # 这里的accuracy_reward是一个函数，返回的是一个list
-                    accuracy_reward_func = torch.tensor(output_reward_func, dtype=torch.float32,
-                                                        device=device)  # 这个就是一个一维张量，其长度是len(prompts)
+                if reward_func.__name__ in {"accuracy_reward", "code_reward"}:
+                    if self.accelerator.is_main_process:
+                        guidance_values = rewards_per_func[:, i]
+                        print(
+                            f"Step {self.state.global_step}: {reward_func.__name__} "
+                            f"mean={guidance_values.mean().item():.4f}, "
+                            f"min={guidance_values.min().item():.4f}, "
+                            f"max={guidance_values.max().item():.4f}"
+                        )
+                    guidance_reward_func = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)  # Cross different devices.
         # 那么此时rewards_per_func的尺寸就是[num_devices * per_device_train_batch_size, len(reward_funcs)]
-        accuracy_reward_tensor = gather(accuracy_reward_func)  # 和整体的reward_per_func一样，这里也把所有设备上的accuracy_reward都收集到一起
 
-        current_micro_batch_accuracy = accuracy_reward_tensor.mean().detach()
+        # Apply weights to each reward function's output and sum
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(
+            dim=1)  # unsqueeze只针对self.reward_weights，请注意
+
+        if guidance_reward_func is not None:
+            guidance_reward_tensor = gather(guidance_reward_func)
+        else:
+            guidance_reward_tensor = rewards
+
+        current_micro_batch_accuracy = guidance_reward_tensor.mean().detach()
 
         if self.accelerator.is_main_process:
-            print(f"\n=== Step {self.state.global_step} Accuracy Debug ===")
-            print(f"accuracy_reward_tensor shape: {accuracy_reward_tensor.shape}")
-            print(f"accuracy_reward_tensor values: {accuracy_reward_tensor}")
-            print(f"accuracy_reward_tensor device: {accuracy_reward_tensor.device}")
-            
-            # 检查每个进程的贡献
-            if accuracy_reward_tensor.dim() > 1:
-                for proc_idx in range(accuracy_reward_tensor.shape[0]):
-                    print(f"Process {proc_idx} accuracy: {accuracy_reward_tensor[proc_idx]}")
-            
-            # 计算总体统计
-            print(f"Min accuracy: {accuracy_reward_tensor.min().item()}")
-            print(f"Max accuracy: {accuracy_reward_tensor.max().item()}")
-            print(f"Mean accuracy: {accuracy_reward_tensor.mean().item()}")
-            print(f"Final current_step_accuracy: {current_micro_batch_accuracy.item()}")
+            print(f"\n=== Step {self.state.global_step} Guidance Reward Debug ===")
+            print(f"guidance_reward_tensor shape: {guidance_reward_tensor.shape}")
+            print(f"Min guidance reward: {guidance_reward_tensor.min().item()}")
+            print(f"Max guidance reward: {guidance_reward_tensor.max().item()}")
+            print(f"Mean guidance reward: {guidance_reward_tensor.mean().item()}")
+            print(f"Final current_step_guidance_reward: {current_micro_batch_accuracy.item()}")
             print("=" * 50)
 
         # 修正：将当前 micro-batch 的准确率添加到列表中，而不是覆盖
@@ -991,11 +1053,8 @@ class GRPOTrainer(Trainer):
         
         if self.accelerator.is_main_process:
             print(f"Step {self.state.global_step}: Added micro-batch accuracy {current_micro_batch_accuracy.item():.4f}")
-            print(f"Step {self.state.global_step}: Current step accuracies so far: {self._step_accuracies}")
+            print(f"Step {self.state.global_step}: Collected {len(self._step_accuracies)} micro-batch guidance rewards")
 
-        # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(
-            dim=1)  # unsqueeze只针对self.reward_weights，请注意
         """
         本来比方说：
         [[1., 2., 3.],
@@ -1071,30 +1130,38 @@ class GRPOTrainer(Trainer):
         self._metrics["reward"].append(rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
 
-        if (
-                self.log_completions
-                and self.state.global_step % self.args.logging_steps == 0
-                and "wandb" in self.args.report_to
-        ):
-            import pandas as pd
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
 
-            # For logging
-            table = {
-                "step": [str(self.state.global_step)] * len(rewards),
-                "prompt": gather_object(prompts_text),
-                "completion": gather_object(completions_text),
-                "reward": rewards.tolist(),
-            }
-            df = pd.DataFrame(table)
+            if self.accelerator.is_main_process:
+                _per_step_completion_writer(
+                    prompts_to_log,
+                    completions_to_log,
+                    rewards_to_log,
+                    self.state.global_step,
+                )
 
-            if wandb.run is not None and self.accelerator.is_main_process:
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
+
+                    table = {
+                        "step": [str(self.state.global_step)] * len(rewards),
+                        "prompt": prompts_to_log,
+                        "completion": completions_to_log,
+                        "reward": rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
 
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "completion_attention_mask": completion_attention_mask,
+            "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         }
@@ -1106,8 +1173,9 @@ class GRPOTrainer(Trainer):
 
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        completion_attention_mask = inputs.get("completion_attention_mask", completion_mask)
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_attention_mask], dim=1)
         logits_to_keep = completion_ids.size(
             1)  # we only need to compute the logits for the completion tokens 通俗点来说就是completion的token数，这个变量是为了在后面从整个prompt+completion中取出completion的一个标量
         # 如果这里是直接接收的_prepare_inputs返回的结果，那么completion_ids的长度还是24k
@@ -1115,21 +1183,35 @@ class GRPOTrainer(Trainer):
                                                     logits_to_keep)  # 注意这里由于completion_mask介入的缘故，padding token会被跳过
 
         # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        if self.beta != 0.0:
+            ref_per_token_logps = inputs["ref_per_token_logps"]
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
 
-        # x - x.detach() allows for preserving gradients from x
+        # Compute clipped GRPO objective.
         advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        old_per_token_logps = inputs["old_per_token_logps"] if self.args.num_iterations > 1 else per_token_logps.detach()
+        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        if self.beta != 0.0:
+            mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+            self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        is_clipped = (per_token_loss1 < per_token_loss2).float()
+        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+        self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
 
         return loss
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import datasets
 import torch
 import transformers
-from datasets import load_dataset
+from datasets import DatasetDict, load_dataset, load_from_disk
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -42,7 +42,40 @@ from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 
+# Replace TRL's rich completion table printer with a per-step JSONL writer so the
+# main training log stays small and each step's completions sit in its own file.
+import json
+import os
+from pathlib import Path
+
+import trl.trainer.grpo_trainer as _grpo_mod
+
+
+def _per_step_completion_writer(prompts, completions, rewards, step):
+    out_dir = Path(os.environ.get("STEP_LOG_DIR", "logs/steps"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"step_{int(step):05d}.jsonl"
+    with path.open("a") as f:
+        for prompt, completion, reward in zip(prompts, completions, rewards):
+            f.write(
+                json.dumps(
+                    {
+                        "step": int(step),
+                        "prompt": prompt,
+                        "completion": completion,
+                        "reward": float(reward),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+_grpo_mod.print_prompt_completions_sample = _per_step_completion_writer
+
+
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -148,8 +181,19 @@ def main(script_args, training_args, model_args):
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
 
-    # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # Load the dataset. If `dataset_name` points to an existing local directory
+    # produced by `Dataset.save_to_disk`, load it offline; otherwise fall through
+    # to HF Hub / cache via `load_dataset`. This lets the curriculum subset
+    # (scripts/build_math_cl_subset.py) drop in without touching HF_HOME.
+    if os.path.isdir(script_args.dataset_name):
+        loaded = load_from_disk(script_args.dataset_name)
+        # Normalize to DatasetDict so `dataset[split]` works downstream.
+        if not isinstance(loaded, DatasetDict):
+            split_name = script_args.dataset_train_split or "train"
+            loaded = DatasetDict({split_name: loaded})
+        dataset = loaded
+    else:
+        dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
     ################
     # Load tokenizer
@@ -186,8 +230,46 @@ def main(script_args, training_args, model_args):
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        prompt.append({"role": "user", "content": example["problem"]})
-        return {"prompt": prompt}
+        # Support both code-style (`problem_statement`, e.g. Blancy/verifiable-coding-problems-CoT)
+        # and math-style (`problem`, e.g. agentica-org/DeepScaleR-Preview-Dataset, MATH-500) schemas.
+        if "problem_statement" in example and example["problem_statement"] is not None:
+            user_content = example["problem_statement"]
+        elif "problem" in example and example["problem"] is not None:
+            user_content = example["problem"]
+        elif "question" in example and example["question"] is not None:
+            user_content = example["question"]
+        else:
+            raise KeyError(
+                "make_conversation: dataset row has no 'problem_statement', 'problem', or 'question' column."
+            )
+        prompt.append({"role": "user", "content": user_content})
+
+        out = {"prompt": prompt}
+
+        # accuracy_reward reads the `solution` kwarg. Math datasets (DeepScaleR,
+        # MATH-500, NuminaMath) ship the parseable gold in `answer`; their
+        # `solution` field, if present, is the long human-written proof which
+        # math_verify cannot consistently extract a single answer from. So when
+        # the row has an `answer`, treat that as the source of truth and wrap
+        # in `$...$` for math_verify's LatexExtractionConfig anchor matching.
+        # Code rows (Blancy/verifiable-coding-problems-CoT) have no `answer`
+        # column and rely on `verification_info` instead, so this branch does
+        # not affect them.
+        if "answer" in example and example["answer"] is not None:
+            answer = str(example["answer"]).strip()
+            if not (answer.startswith("$") and answer.endswith("$")) and "\\boxed" not in answer:
+                answer = f"${answer}$"
+            out["solution"] = answer
+
+        # G2RPOATrainer._prepare_inputs reads `example["generations"]` to build the
+        # guidance prefix (it tokenizes the long-trace and slices to guidance_length).
+        # The Blancy code dataset has this column; math datasets do not. Fall back
+        # to the human-written `solution` proof, then to `answer`.
+        if "generations" not in example or example.get("generations") is None:
+            trace = example.get("solution") or example.get("answer")
+            if trace is not None:
+                out["generations"] = str(trace)
+        return out
 
     dataset = dataset.map(make_conversation)
 
@@ -208,10 +290,24 @@ def main(script_args, training_args, model_args):
     )
     training_args.model_init_kwargs = model_kwargs
 
+    # With a single training process and two visible GPUs, HF Trainer would wrap the
+    # policy in DataParallel and occupy the vLLM GPU too. Keep the policy on the
+    # process device; vLLM still sees the extra visible GPU and uses it via `auto`.
+    if training_args.use_vllm and training_args.n_gpu > 1 and training_args.local_rank in {-1, 0}:
+        logger.info(f"Restricting HF Trainer n_gpu from {training_args.n_gpu} to 1 because use_vllm=True")
+        training_args._n_gpu = 1
+
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    if training_args.use_g2rpoa:
+        from open_r1.trainer.g2rpoa_trainer import G2RPOATrainer
+
+        trainer_cls = G2RPOATrainer
+    else:
+        trainer_cls = GRPOTrainer
+    logger.info(f"Using trainer class: {trainer_cls.__name__}")
+    trainer = trainer_cls(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,

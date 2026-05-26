@@ -1,0 +1,30 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local training/evaluation artifacts
+data/
+logs/
+eval_results/
+swanlog/
+archives/
+
+# Large local wheels / model artifacts
+*.whl
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# Local scratch/session files
+opencode.txt
+.claude/
+
+# Secrets and local env files
+.env
+.env.*
+*.key
+*.pem
